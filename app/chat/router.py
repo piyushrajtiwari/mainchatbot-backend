@@ -1,7 +1,7 @@
 import json
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
-from langchain_core.messages import HumanMessage,SystemMessage,AIMessage
+from langchain_core.messages import HumanMessage,AIMessage,ToolMessage
 from app.chat.schema import ChatMessage
 from app.auth.dependancy import CurrentUser
 from app.chat.service import get_workflow
@@ -35,9 +35,17 @@ async def chat(data: ChatMessage, user: CurrentUser):
                     msg, metadata = chunk["data"]
                 else:
                     msg, metadata = chunk
+                    
+                if isinstance(msg, ToolMessage):
+                    continue
 
-                if msg.content:
-                    yield json.dumps({"type": "token", "content": msg.content}) + "\n"
+                if isinstance(msg, AIMessage):
+                    if msg.tool_calls:
+                        continue
+
+                    if msg.content:
+                        if isinstance(msg.content, str):
+                            yield json.dumps({"type": "token", "content": msg.content}) + "\n"
             yield json.dumps({"type": "done"}) + "\n"
         except Exception as e:
             print("Chat error:", repr(e), flush=True)

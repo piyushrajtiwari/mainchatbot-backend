@@ -7,14 +7,21 @@ from langgraph.graph import StateGraph, START, END, add_messages
 from langchain_core.messages import BaseMessage,SystemMessage
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from app.core.prompts import system_prompt
+from app.chat.tools import all_tools
+from langgraph.prebuilt import ToolNode, tools_condition
+
+tools = all_tools
 
 
-llm = ChatGroq(
+model = ChatGroq(
     model="openai/gpt-oss-120b",
-    temperature=0.5,
+    temperature=0.2,  # Change 0.5 to 0.2 for tool calling - more accurate
     api_key=settings.GROQ_API_KEY,
     streaming=True,
 )
+
+# THIS is the line that binds tools
+llm = model.bind_tools(all_tools)
 
 class ChatState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
@@ -28,9 +35,18 @@ graph = StateGraph(ChatState)
 
 
 graph.add_node("chat_node", chat_node)
+graph.add_node("tools", ToolNode(all_tools))
 
 graph.add_edge(START, "chat_node")
-graph.add_edge("chat_node", END)
+graph.add_conditional_edges(
+    "chat_node",
+    tools_condition,
+    {
+        "tools": "tools",
+        "__end__": END,
+    },
+)
+graph.add_edge("tools", "chat_node")
 
 
 workflow = None

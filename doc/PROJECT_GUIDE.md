@@ -8,11 +8,11 @@
 | --- | --- | --- |
 | Application | [app/main.py](../app/main.py) | Mounts auth and chat routes, exposes health, and manages startup and shutdown |
 | Accounts | [app/auth/](../app/auth/) | Validates requests, manages accounts and sessions, and sends verification and reset emails via Resend |
-| Chat | [app/chat/](../app/chat/) | Reads and writes account-scoped threads and streams replies from the LangGraph workflow |
+| Chat | [app/chat/](../app/chat/) | Reads and writes account-scoped threads, runs lookup tools, and streams replies from LangGraph |
 | Database | [app/db/](../app/db/), [alembic/](../alembic/) | Defines database sessions and Alembic migrations for authentication tables |
 | HTTP configuration | [app/core/](../app/core/) | Loads settings and defines cookies, middleware, and the system prompt |
 
-At startup, the app initializes `AsyncPostgresSaver` and compiles the graph. Each chat turn combines the system prompt with saved messages and calls Groq's `openai/gpt-oss-120b` model. LangGraph checkpoints the conversation state so later turns can continue on the same thread.
+At startup, the app initializes `AsyncPostgresSaver` and compiles the graph. Each chat turn combines the system prompt with saved messages and calls Groq's `openai/gpt-oss-120b` model. When the model requests a tool, LangGraph runs it and returns the result to the model. LangGraph checkpoints the conversation state so later turns can continue on the same thread.
 
 ```mermaid
 flowchart LR
@@ -23,8 +23,23 @@ flowchart LR
     API -->|List and load threads| Checkpoints[(PostgreSQL checkpoints)]
     Graph -->|Read and write state| Checkpoints
     Graph -->|Generate replies| Groq
+    Graph -->|Run requested lookup| Tools[Weather, search, and flight providers]
     API -->|NDJSON reply| Browser
 ```
+
+## Chat tools
+
+The tools run inside the existing chat workflow. Send requests through `POST /chat/chat-message` using the usual message body. The model decides when a lookup is needed. [Tool implementations](../app/chat/tools.py) · [Graph routing](../app/chat/service.py)
+
+| Tool | Input | Provider and result |
+| --- | --- | --- |
+| `get_weather` | City name | Open-Meteo geocoding and current conditions, including temperature, humidity, wind, and precipitation |
+| `search_web` | Search query | DuckDuckGo text search through `duckduckgo_search`, with up to five titles, snippets, and source URLs |
+| `get_flight_delay_prediction` | IATA flight number such as `6E2017` | AviationStack status, departure timing, and delay in minutes when available. AviationWeather.gov METAR observations provide context for supported Indian departure airports. |
+
+Flight lookups report the provider's departure status and timing. A missing or null delay is unknown. An explicit zero can be reported as on time. Airport observations are weather context, and delay causes need confirmation from the airline. The AviationStack request uses HTTPS, passes the key as the required query parameter, and refuses redirects. [AviationStack authentication and errors](https://docs.apilayer.com/apilayer/docs/getting-started-10)
+
+The weather tool maps documented weather codes and displays **Unknown** for unfamiliar codes. The weather and flight tools check the HTTP status and validate the response before using it. Provider failures return a generic message, and a failed airport-weather lookup leaves the flight result available. [Open-Meteo forecast API](https://open-meteo.com/en/docs)
 
 ## Databases and environment
 
@@ -36,6 +51,7 @@ flowchart LR
 | `SECRET_KEY`, `ALGORITHM` | JWT signing and verification |
 | `ACCESS_TOKEN_EXPIRE_MINUTES`, `REFRESH_TOKEN_EXPIRE_DAYS` | Access and refresh session lifetimes |
 | `GROQ_API_KEY` | Model access |
+| `AVIATIONSTACK_KEY` | Required startup setting for AviationStack flight-status requests |
 | `RESEND_API_KEY`, `FROM_EMAIL` | Transactional email delivery |
 | `BACKEND_URL`, `FRONTEND_URL` | Public origins used when building email links. Set `FRONTEND_URL` for the React reset flow. |
 | `CORS_ORIGINS` | JSON array of exact browser origins. The origin of `FRONTEND_URL` is added automatically. |
@@ -61,7 +77,7 @@ Use [the local Swagger UI](http://127.0.0.1:8000/docs) for request validation an
 | `POST /auth/logout` | Authenticated request | Revokes the account's refresh sessions and clears cookies |
 | `GET /chat/chats` | Authenticated request | Conversation summaries with `id`, `title`, and `user_id`, newest checkpoint first |
 | `GET /chat/current-chat/{thread_id}` | Authenticated request with the client thread ID | Saved messages in conversation order, or an empty array when the thread has no messages |
-| `POST /chat/chat-message` | Authenticated JSON `thread_id`, `messages`, and optional `title` | An NDJSON stream with incremental assistant output |
+| `POST /chat/chat-message` | Authenticated JSON `thread_id`, `messages`, and optional `title` | An NDJSON response with the completed assistant text |
 
 Access authentication accepts an `Authorization: Bearer` token or the `access_token` cookie. The browser uses HTTP-only cookies with `SameSite=Lax`. The access cookie uses `/` and the refresh cookie is scoped to `/auth`. For a matching account, a recovery request issues a new reset token and invalidates previous unused ones. The database stores a hash of the reset token.
 
@@ -69,8 +85,8 @@ Access authentication accepts an `Authorization: Bearer` token or the `access_to
 
 1. The frontend generates a thread ID with the first submitted message. Use that same client ID for later messages and reads.
 2. The backend prefixes the ID with the authenticated account ID when addressing a checkpoint. Clients send the unprefixed ID.
-3. The stream emits one JSON object per line. A successful stream ends with `done`. A generation failure emits `error`, which the client must handle even if the HTTP response already started.
-4. The history endpoint returns `human` and `ai` records. It omits empty assistant content and internal messages. The sidebar endpoint uses saved title metadata or the first human message as a fallback.
+3. The stream waits for a completed model update to determine whether it requested a tool. It emits the final nonempty assistant text as a `token` record and ends with `done`. A generation failure emits a generic `error` record.
+4. The history endpoint returns `human` and `ai` records. Both response paths omit tool-call turns, tool results, and empty assistant text. LangGraph keeps tool context in its checkpoint for the model. The sidebar uses saved title metadata or the first human message as a fallback.
 
 Example first message body
 
@@ -101,7 +117,8 @@ Example saved transcript
 | Startup fails before `/health` is reachable | Check required settings, PostgreSQL connectivity, and checkpoint initialization permissions. |
 | Sign-in or registration fails with a missing-table error | Apply `python -m alembic upgrade head` and confirm the runtime auth connection points to the migrated database. |
 | Verification or reset email never arrives | Check Resend credentials, sender authorization, delivery logs, and `FRONTEND_URL`. Reset links expire after 15 minutes. |
+| Chat lookup fails | Check outbound access to the relevant provider. For flight status, also check `AVIATIONSTACK_KEY` and provider access for the flight. |
 | Browser API requests fail with a CORS error | Confirm the origin includes the correct scheme, host, and port. Review the [middleware configuration](../MIDDLEWARE.md). |
-| The assistant reply arrives in one large block | Verify the reverse proxy forwards streaming response chunks without buffering. The chat API serves `application/x-ndjson`. |
+| The chat stays pending during a lookup | The API sends final text after any tool calls and model generation complete. Keep proxy buffering disabled so NDJSON completion and error events can reach the browser promptly. |
 
-For deployment, use HTTPS and set the cookie `secure` flags in [app/core/cookies.py](../app/core/cookies.py). The current code sets them to `False` for local HTTP. Keep the browser app and public API on one origin for the existing cookie flow and preserve the `/auth` prefix. The chat stream currently includes provider error text in its `error` records. Treat those details as internal when preparing a public deployment.
+For deployment, use HTTPS and set the cookie `secure` flags. The current code sets them to `False` for local HTTP. Keep the browser app and public API on one origin for the existing cookie flow and preserve the `/auth` prefix. [Cookie settings](../app/core/cookies.py)
