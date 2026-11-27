@@ -1,6 +1,6 @@
 # MainChatbot backend
 
-FastAPI service for the MainChatbot web app. It handles account registration, email verification, password recovery, and authenticated chat. LangGraph sends messages to Groq, streams replies to the browser, and stores conversation state in PostgreSQL. The assistant can also look up current weather, search the web, and retrieve flight status. [Chat tools and provider behavior](doc/PROJECT_GUIDE.md#chat-tools)
+FastAPI service for the MainChatbot web app. It handles account registration, email verification, password recovery, and authenticated chat. LangGraph sends messages to Groq, delivers final replies over NDJSON, and stores conversation state in PostgreSQL. The assistant can also look up current weather, search the web, and retrieve flight status. [Chat tools and provider behavior](doc/PROJECT_GUIDE.md#chat-tools)
 
 ## Run locally
 
@@ -37,7 +37,7 @@ Run the commands from `backend_chatbot/`. You need Python 3.10 or newer, Postgre
    CORS_ORIGINS=["http://localhost:5173","http://127.0.0.1:5173"]
    ```
 
-   You can generate a signing secret with `python -c "import secrets; print(secrets.token_urlsafe(48))"`. Set `FRONTEND_URL` to the browser origin you actually use so verification and reset emails open the React app. The backend requires `AVIATIONSTACK_KEY` at startup. For unit tests, set a placeholder value.
+   You can generate a signing secret with `python -c "import secrets; print(secrets.token_urlsafe(48))"`. Set `FRONTEND_URL` to the browser origin you actually use so verification and reset emails open the React app. The backend requires `AVIATIONSTACK_KEY` at startup.
 
 3. Apply the auth migrations and start the server.
 
@@ -50,13 +50,11 @@ Run the commands from `backend_chatbot/`. You need Python 3.10 or newer, Postgre
 
 ## Tests
 
-Run the unit tests with the backend settings present. It is safe to use placeholder credentials and syntactically valid PostgreSQL URLs for this suite. The chat tests mock the database and model workflow, and the middleware tests use an in-process FastAPI app.
+The suite supplies placeholder settings and mocks external services. Chat tests cover direct replies, tool execution, cancellation, history filtering, and provider failures. Middleware tests use an in-process FastAPI app.
 
 ```sh
 python -m unittest discover -s test -v
 ```
-
-The current suite has one known failure. The chat continuity test mocks `astream_events`, while the router now calls `astream`. The other eight tests pass.
 
 ## Documentation
 
