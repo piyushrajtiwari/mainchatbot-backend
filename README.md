@@ -1,10 +1,10 @@
 # MainChatbot backend
 
-FastAPI service for the MainChatbot web app. It handles account registration, email verification, password recovery, and authenticated chat. LangGraph sends messages to Groq, streams replies to the browser, and stores conversation state in PostgreSQL.
+FastAPI service for the MainChatbot web app. It handles account registration, email verification, password recovery, and authenticated chat. LangGraph sends messages to Groq, streams replies to the browser, and stores conversation state in PostgreSQL. The assistant can also look up current weather, search the web, and retrieve flight status. [Chat tools and provider behavior](doc/PROJECT_GUIDE.md#chat-tools)
 
 ## Run locally
 
-You need Python 3.10 or newer, a PostgreSQL database, a Groq API key with access to the configured model, and a Resend API key with an authorized sender address. Run the commands from `backend_chatbot/`.
+Run the commands from `backend_chatbot/`. You need Python 3.10 or newer, PostgreSQL, a Groq API key with access to the configured model, a Resend API key with an authorized sender address, and an AviationStack API key for flight status.
 
 1. Create a virtual environment and install the pinned dependencies.
 
@@ -14,7 +14,7 @@ You need Python 3.10 or newer, a PostgreSQL database, a Groq API key with access
    python -m pip install -r requirements.txt
    ```
 
-   On macOS or Linux, activate with `source .venv/bin/activate`. If PowerShell blocks activation, use `..venvScriptspython.exe` in place of `python` for the remaining commands.
+   On macOS or Linux, activate with `source .venv/bin/activate`. If PowerShell blocks activation, use `.\.venv\Scripts\python.exe` in place of `python` for the remaining commands.
 
 2. Create `.env` in this directory and replace the placeholders. The three database URLs can point to the same local PostgreSQL database.
 
@@ -29,6 +29,7 @@ You need Python 3.10 or newer, a PostgreSQL database, a Groq API key with access
    CHECKPOINT_DATABASE_URL=postgresql://mainchatbot:local-password@127.0.0.1:5432/mainchatbot
 
    GROQ_API_KEY=replace-with-groq-key
+   AVIATIONSTACK_KEY=replace-with-aviationstack-key
    RESEND_API_KEY=replace-with-resend-key
    FROM_EMAIL="MainChatbot <hello@example.com>"
    BACKEND_URL=http://127.0.0.1:8000
@@ -36,7 +37,7 @@ You need Python 3.10 or newer, a PostgreSQL database, a Groq API key with access
    CORS_ORIGINS=["http://localhost:5173","http://127.0.0.1:5173"]
    ```
 
-   You can generate a signing secret with `python -c "import secrets; print(secrets.token_urlsafe(48))"`. Set `FRONTEND_URL` to the browser origin you actually use so verification and reset emails open the React app.
+   You can generate a signing secret with `python -c "import secrets; print(secrets.token_urlsafe(48))"`. Set `FRONTEND_URL` to the browser origin you actually use so verification and reset emails open the React app. The backend requires `AVIATIONSTACK_KEY` at startup. For unit tests, set a placeholder value.
 
 3. Apply the auth migrations and start the server.
 
@@ -61,6 +62,6 @@ The current suite has one known failure. The chat continuity test mocks `astream
 
 | Document | Contents |
 | --- | --- |
-| [Project guide](doc/PROJECT_GUIDE.md) | Architecture, database setup, API contracts, and troubleshooting |
+| [Project guide](doc/PROJECT_GUIDE.md) | Architecture, chat tools, database setup, API contracts, and troubleshooting |
 | [HTTP middleware](MIDDLEWARE.md) | Request IDs, security headers, streaming, and CORS |
 | [Changelog](CHANGELOG.md) | Current unreleased changes |

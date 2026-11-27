@@ -8,11 +8,11 @@
 | --- | --- | --- |
 | Application | [app/main.py](../app/main.py) | Mounts auth and chat routes, exposes health, and manages startup and shutdown |
 | Accounts | [app/auth/](../app/auth/) | Validates requests, manages accounts and sessions, and sends verification and reset emails via Resend |
-| Chat | [app/chat/](../app/chat/) | Reads and writes account-scoped threads and streams replies from the LangGraph workflow |
+| Chat | [app/chat/](../app/chat/) | Reads and writes account-scoped threads, runs lookup tools, and streams replies from LangGraph |
 | Database | [app/db/](../app/db/), [alembic/](../alembic/) | Defines database sessions and Alembic migrations for authentication tables |
 | HTTP configuration | [app/core/](../app/core/) | Loads settings and defines cookies, middleware, and the system prompt |
 
-At startup, the app initializes `AsyncPostgresSaver` and compiles the graph. Each chat turn combines the system prompt with saved messages and calls Groq's `openai/gpt-oss-120b` model. LangGraph checkpoints the conversation state so later turns can continue on the same thread.
+At startup, the app initializes `AsyncPostgresSaver` and compiles the graph. Each chat turn combines the system prompt with saved messages and calls Groq's `openai/gpt-oss-120b` model. When the model requests a tool, LangGraph runs it and returns the result to the model. LangGraph checkpoints the conversation state so later turns can continue on the same thread.
 
 ```mermaid
 flowchart LR
@@ -23,8 +23,21 @@ flowchart LR
     API -->|List and load threads| Checkpoints[(PostgreSQL checkpoints)]
     Graph -->|Read and write state| Checkpoints
     Graph -->|Generate replies| Groq
+    Graph -->|Run requested lookup| Tools[Weather, search, and flight providers]
     API -->|NDJSON reply| Browser
 ```
+
+## Chat tools
+
+The tools run inside the existing chat workflow. Send requests through `POST /chat/chat-message` using the usual message body. The model decides when a lookup is needed. [Tool implementations](../app/chat/tools.py) · [Graph routing](../app/chat/service.py)
+
+| Tool | Input | Provider and result |
+| --- | --- | --- |
+| `get_weather` | City name | Open-Meteo geocoding and current conditions, including temperature, humidity, wind, and precipitation |
+| `search_web` | Search query | DuckDuckGo text search through `duckduckgo_search`, with up to five titles, snippets, and source URLs |
+| `get_flight_delay_prediction` | IATA flight number such as `6E2017` | AviationStack status, departure timing, and delay in minutes when available. AviationWeather.gov METAR observations provide context for supported Indian departure airports. |
+
+Flight delay explanations use status and weather heuristics. Get confirmed status and delay reasons from the airline. The AviationStack request currently sends the key in the query string over HTTP. Use an HTTPS endpoint before sending a production key.
 
 ## Databases and environment
 
@@ -36,6 +49,7 @@ flowchart LR
 | `SECRET_KEY`, `ALGORITHM` | JWT signing and verification |
 | `ACCESS_TOKEN_EXPIRE_MINUTES`, `REFRESH_TOKEN_EXPIRE_DAYS` | Access and refresh session lifetimes |
 | `GROQ_API_KEY` | Model access |
+| `AVIATIONSTACK_KEY` | Required startup setting for AviationStack flight-status requests |
 | `RESEND_API_KEY`, `FROM_EMAIL` | Transactional email delivery |
 | `BACKEND_URL`, `FRONTEND_URL` | Public origins used when building email links. Set `FRONTEND_URL` for the React reset flow. |
 | `CORS_ORIGINS` | JSON array of exact browser origins. The origin of `FRONTEND_URL` is added automatically. |
@@ -69,7 +83,7 @@ Access authentication accepts an `Authorization: Bearer` token or the `access_to
 
 1. The frontend generates a thread ID with the first submitted message. Use that same client ID for later messages and reads.
 2. The backend prefixes the ID with the authenticated account ID when addressing a checkpoint. Clients send the unprefixed ID.
-3. The stream emits one JSON object per line. A successful stream ends with `done`. A generation failure emits `error`, which the client must handle even if the HTTP response already started.
+3. The stream emits one JSON object per line. It forwards nonempty message content, which can include intermediate tool results. A successful stream ends with `done`. A generation failure emits `error`, which the client must handle even if the HTTP response already started.
 4. The history endpoint returns `human` and `ai` records. It omits empty assistant content and internal messages. The sidebar endpoint uses saved title metadata or the first human message as a fallback.
 
 Example first message body
@@ -101,6 +115,7 @@ Example saved transcript
 | Startup fails before `/health` is reachable | Check required settings, PostgreSQL connectivity, and checkpoint initialization permissions. |
 | Sign-in or registration fails with a missing-table error | Apply `python -m alembic upgrade head` and confirm the runtime auth connection points to the migrated database. |
 | Verification or reset email never arrives | Check Resend credentials, sender authorization, delivery logs, and `FRONTEND_URL`. Reset links expire after 15 minutes. |
+| Chat lookup fails | Check outbound access to the relevant provider. For flight status, also check `AVIATIONSTACK_KEY` and provider access for the flight. |
 | Browser API requests fail with a CORS error | Confirm the origin includes the correct scheme, host, and port. Review the [middleware configuration](../MIDDLEWARE.md). |
 | The assistant reply arrives in one large block | Verify the reverse proxy forwards streaming response chunks without buffering. The chat API serves `application/x-ndjson`. |
 
