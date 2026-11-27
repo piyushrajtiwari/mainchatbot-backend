@@ -1,19 +1,110 @@
-import os
+from math import isfinite
+
 import requests
-from langchain_core.tools import tool
-from app.core.settings import settings
 from duckduckgo_search import DDGS
+from duckduckgo_search.exceptions import DuckDuckGoSearchException
+from langchain_core.tools import tool
+
+from app.core.settings import settings
+
+
+class ProviderError(Exception):
+    """The upstream provider was unavailable or returned unusable data."""
+
+
+def _get_json(url, params, timeout):
+    try:
+        response = requests.get(url, params=params, timeout=timeout, allow_redirects=False)
+        response.raise_for_status()
+        if not 200 <= response.status_code < 300:
+            raise ProviderError
+        return response.json()
+    except (requests.RequestException, ValueError):
+        # Provider exceptions can contain request URLs, credentials, and response bodies.
+        raise ProviderError from None
+
+
+def _provider_object(data):
+    if not isinstance(data, dict) or data.get("error"):
+        raise ProviderError
+    return data
+
+
+def _number(value):
+    return type(value) is int or isinstance(value, float) and isfinite(value)
+
+
+def _text(value, fallback="Unavailable"):
+    return value.strip() if isinstance(value, str) and value.strip() else fallback
 
 
 def _get_coordinates(city: str):
     """City name to lat/lon using Open-Meteo Geocoding"""
     url = "https://geocoding-api.open-meteo.com/v1/search"
-    res = requests.get(url, params={"name": city, "count": 1, "language": "en", "format": "json"}, timeout=10)
-    data = res.json()
-    if not data.get("results"):
+    params = {"name": city, "count": 1, "language": "en", "format": "json"}
+    data = _provider_object(_get_json(url, params, 10))
+    if "results" not in data and _number(data.get("generationtime_ms")):
         return None
-    r = data["results"][0]
-    return r["latitude"], r["longitude"], r["name"], r.get("country", "")
+    results = data.get("results")
+    if not isinstance(results, list):
+        raise ProviderError
+    if not results:
+        return None
+    place = _provider_object(results[0])
+    latitude, longitude = place.get("latitude"), place.get("longitude")
+    name = _text(place.get("name"), "")
+    if not name or not (_number(latitude) and -90 <= latitude <= 90
+                        and _number(longitude) and -180 <= longitude <= 180):
+        raise ProviderError
+    return latitude, longitude, name, _text(place.get("country"), "")
+
+
+WEATHER_CODES = {
+    0: "Clear sky", 1: "Mostly clear", 2: "Partly cloudy", 3: "Overcast",
+    45: "Fog", 48: "Rime fog",
+    51: "Light drizzle", 53: "Moderate drizzle", 55: "Dense drizzle",
+    56: "Light freezing drizzle", 57: "Dense freezing drizzle",
+    61: "Light rain", 63: "Moderate rain", 65: "Heavy rain",
+    66: "Light freezing rain", 67: "Heavy freezing rain",
+    71: "Light snowfall", 73: "Moderate snowfall", 75: "Heavy snowfall", 77: "Snow grains",
+    80: "Light rain showers", 81: "Moderate rain showers", 82: "Violent rain showers",
+    85: "Light snow showers", 86: "Heavy snow showers",
+    95: "Thunderstorm", 96: "Thunderstorm with light hail",
+    97: "Heavy thunderstorm", 99: "Thunderstorm with heavy hail",
+}
+
+WEATHER_METRICS = {
+    "temperature_2m": "°C",
+    "apparent_temperature": "°C",
+    "relative_humidity_2m": "%",
+    "wind_speed_10m": " km/h",
+    "precipitation": " mm",
+}
+
+
+def _get_current_weather(latitude, longitude):
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "current": ",".join((*WEATHER_METRICS, "weather_code")),
+        "timezone": "auto",
+    }
+    data = _provider_object(_get_json(url, params, 10))
+    current = _provider_object(data.get("current"))
+    metrics = {}
+    for field, unit in WEATHER_METRICS.items():
+        value = current.get(field)
+        if value is not None and not _number(value):
+            raise ProviderError
+        metrics[field] = "Unavailable" if value is None else f"{value}{unit}"
+
+    code = current.get("weather_code")
+    if code is not None and type(code) is not int:
+        raise ProviderError
+    if code is None and all(value == "Unavailable" for value in metrics.values()):
+        raise ProviderError
+    return WEATHER_CODES.get(code, "Unknown"), metrics
 
 AIRPORT_ICAO = {
     "DEL": "VIDP",  # Delhi
@@ -28,26 +119,16 @@ AIRPORT_ICAO = {
     "JAI": "VIJP",  # Jaipur
 }
 
-def _get_weather_reason(icao_code: str):
-    """Fetch live METAR weather for an airport."""
+def _get_airport_observation(icao_code: str):
+    """Return optional METAR context for the departure airport."""
+    url = "https://aviationweather.gov/api/data/metar"
     try:
-        url = f"https://aviationweather.gov/api/data/metar?ids={icao_code}&format=json"
-        res = requests.get(url, timeout=10)
-        data = res.json()
-
-        if not data:
-            return None
-
-        metar = data[0]
-        return {
-            "raw": metar.get("rawOb", ""),
-            "visibility_km": metar.get("visib", 10),
-            "weather": metar.get("wxString", ""),
-            "temp": metar.get("temp"),
-            "wind_speed": metar.get("wspd"),
-        }
-    except Exception:
-        return None
+        data = _get_json(url, {"ids": icao_code, "format": "json"}, 10)
+        if isinstance(data, list) and data:
+            return _text(_provider_object(data[0]).get("rawOb"), "")
+    except ProviderError:
+        pass
+    return ""
 
 @tool
 def get_weather(city: str) -> str:
@@ -58,39 +139,23 @@ def get_weather(city: str) -> str:
     Args:
         city: City name like "Delhi", "Mumbai", "Bangalore"
     """
-    coords = _get_coordinates(city)
-    if not coords:
-        return f"City '{city}' not found. Please try another city name."
+    try:
+        coords = _get_coordinates(city)
+        if coords is None:
+            return f"City '{city}' not found. Please try another city name."
+        latitude, longitude, name, country = coords
+        condition, metrics = _get_current_weather(latitude, longitude)
+    except ProviderError:
+        return "Current weather is unavailable. Please try again."
 
-    lat, lon, name, country = coords
-
-    url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "current": "temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m,wind_direction_10m",
-        "timezone": "auto",
-    }
-    res = requests.get(url, params=params, timeout=10)
-    data = res.json()
-    cur = data.get("current", {})
-
-    # Weather code to readable text
-    code_map = {
-        0: "Clear Sky", 1: "Mainly Clear", 2: "Partly Cloudy", 3: "Overcast",
-        45: "Fog", 48: "Fog", 51: "Light Drizzle", 61: "Light Rain",
-        63: "Moderate Rain", 65: "Heavy Rain", 71: "Light Snow",
-        80: "Light Rain Showers", 95: "Thunderstorm", 99: "Thunderstorm with Hail"
-    }
-    condition = code_map.get(cur.get("weather_code"), "Unknown")
-
+    location = f"{name}, {country}" if country else name
     return (
-        f"\n Weather in {name}, {country}:\n"
+        f"Weather in {location}:\n"
         f"Condition: {condition}\n"
-        f"Temperature: {cur.get('temperature_2m')}°C (Feels like {cur.get('apparent_temperature')}°C)\n"
-        f"Humidity: {cur.get('relative_humidity_2m')}%\n"
-        f"Wind: {cur.get('wind_speed_10m')} km/h\n"
-        f"Rain: {cur.get('precipitation')} mm\n"
+        f"Temperature: {metrics['temperature_2m']} (Feels like {metrics['apparent_temperature']})\n"
+        f"Humidity: {metrics['relative_humidity_2m']}\n"
+        f"Wind: {metrics['wind_speed_10m']}\n"
+        f"Precipitation: {metrics['precipitation']}\n"
     )
 
 
@@ -106,113 +171,84 @@ def search_web(query: str) -> str:
     """
     try:
         with DDGS() as ddgs:
-            # Get top 5 results
-            results = list(ddgs.text(query, max_results=5))
+            results = ddgs.text(query, max_results=5)
+        if not isinstance(results, list) or any(not isinstance(row, dict) for row in results):
+            raise ProviderError
+    except (DuckDuckGoSearchException, ProviderError):
+        return "Web search is unavailable. Please try again."
 
-        if not results:
-            return f"No results found for '{query}'."
+    if not results:
+        return f"No results found for '{query}'."
 
-        output = f"\n🔍 Search results for '{query}':\n\n"
-        for i, r in enumerate(results, 1):
-            title = r.get("title", "")
-            body = r.get("body", "")
-            href = r.get("href", "")
-            output += f"{i}. {title}\n   {body}\n   Source: {href}\n\n"
-
-        return output
-
-    except Exception as e:
-        return f"Search failed: {e}"
+    output = [f"Search results for '{query}':"]
+    for index, result in enumerate(results, 1):
+        title = _text(result.get("title"), "")
+        body = _text(result.get("body"), "")
+        href = _text(result.get("href"), "")
+        output.append(f"{index}. {title}\n   {body}\n   Source: {href}")
+    return "\n\n".join(output)
 
 @tool
 def get_flight_delay_prediction(flight_iata: str) -> str:
-    """
-    Get delay status and reason for any Indian flight.
-    Use this when user asks: "Why is 6E2017 late?", "How much delay for AI202?", "When will my flight arrive?"
+    """Look up an airline flight's reported departure status, timing, and delay.
+
+    For supported Indian departure airports, include the current airport weather
+    as context. Weather alone cannot establish why the flight was delayed.
 
     Args:
         flight_iata: Flight number like "6E2017", "AI202", "SG123"
     """
-    # 1. Get flight status from AviationStack
+    flight_iata = "".join(flight_iata.upper().split())
+    params = {"access_key": settings.AVIATIONSTACK_KEY, "flight_iata": flight_iata}
     try:
-        params = {
-            "access_key": settings.AVIATIONSTACK_KEY,
-            "flight_iata": flight_iata.upper().replace(" ", ""),
-        }
-        res = requests.get(
-            "http://api.aviationstack.com/v1/flights", params=params, timeout=15
-        )
-        data = res.json()
-    except Exception as e:
-        return f"Flight API error: {e}"
+        payload = _provider_object(_get_json("https://api.aviationstack.com/v1/flights", params, 15))
+        flights = payload.get("data")
+        if not isinstance(flights, list):
+            raise ProviderError
+        if not flights:
+            return f"Flight {flight_iata} not found. Please check the flight number."
 
-    if not data.get("data"):
-        return f"Flight {flight_iata} not found. Please enter a valid flight number like 6E2017."
+        flight = _provider_object(flights[0])
+        departure = _provider_object(flight.get("departure"))
+        arrival = _provider_object(flight.get("arrival", {}))
+        airline = _provider_object(flight.get("airline", {}))
+        flight_info = _provider_object(flight.get("flight", {}))
+        status = _text(flight.get("flight_status"), "").lower()
+        delay = departure.get("delay")
+        if not status or (delay is not None and type(delay) is not int):
+            raise ProviderError
+    except ProviderError:
+        return "Flight status is unavailable. Please try again."
 
-    flight = data["data"][0]
-
-    dep = flight.get("departure", {})
-    arr = flight.get("arrival", {})
-    airline = flight.get("airline", {}).get("name", "")
-    flight_no = flight.get("flight", {}).get("iata", flight_iata)
-
-    dep_airport = dep.get("airport", "")
-    dep_iata = dep.get("iata", "")
-    arr_airport = arr.get("airport", "")
-    arr_iata = arr.get("iata", "")
-
-    delay = dep.get("delay") or 0  # in minutes
-    status = flight.get("flight_status", "unknown")
-    scheduled = dep.get("scheduled", "")
-    estimated = dep.get("estimated", "")
-
-    # 2. Get departure airport weather
-    icao = AIRPORT_ICAO.get(dep_iata, "")
-    weather = _get_weather_reason(icao) if icao else None
-
-    # 3. Build response
-    result = f"\n✈️ Flight: {airline} {flight_no}\n"
-    result += f"Route: {dep_airport} ({dep_iata}) -> {arr_airport} ({arr_iata})\n"
-    result += f"Status: {status}\n"
-    result += f"Scheduled: {scheduled}\n"
-    result += f"Estimated: {estimated}\n\n"
-
+    departure_iata = _text(departure.get("iata"), "")
+    departure_airport = _text(departure.get("airport"), departure_iata or "Unknown airport")
+    arrival_airport = _text(arrival.get("airport"), _text(arrival.get("iata"), "Unknown airport"))
+    flight_number = _text(flight_info.get("iata"), flight_iata)
+    airline_name = _text(airline.get("name"), "")
+    result = [
+        f"Flight: {flight_number} {airline_name}".rstrip(),
+        f"Route: {departure_airport} → {arrival_airport}",
+        f"Status: {status}",
+        f"Scheduled departure: {_text(departure.get('scheduled'))}",
+        f"Estimated departure: {_text(departure.get('estimated'))}",
+    ]
     if status == "cancelled":
-        return result + "❌ Flight has been CANCELLED. Please contact the airline."
-
-    if delay == 0 and status in ["scheduled", "active"]:
-        result += "✅ Flight is ON-TIME, no delay."
-        if weather:
-            result += f"\nWeather: {weather['raw']}"
-        return result
-
-    # Delay exists, find the reason
-    result += f"⏰ Delay: {delay} minutes late.\n\n"
-    result += "📌 Reason:\n"
-
-    # Reason 1: Fog - Low visibility
-    if weather and weather["visibility_km"] is not None and weather["visibility_km"] < 1:
-        result += f"- FOG at {dep_airport}. Visibility is only {weather['visibility_km']} km.\n"
-        result += "- Flight is delayed due to fog.\n"
-        result += f"- Live METAR: {weather['raw']}\n"
-
-    # Reason 2: Rain / Thunderstorm
-    elif weather and ("RA" in weather["weather"] or "TS" in weather["weather"]):
-        result += f"- Rain / Thunderstorm at {dep_airport}.\n"
-        result += f"- Weather: {weather['weather']}\n"
-        result += f"- Live METAR: {weather['raw']}\n"
-
-    # Reason 3: High Wind
-    elif weather and weather["wind_speed"] and weather["wind_speed"] > 25:
-        result += f"- High wind at {dep_airport} ({weather['wind_speed']} knots).\n"
-        result += "- ATC has kept the flight on hold for safety.\n"
-
-    # Reason 4: Rotational Delay - Late incoming aircraft
+        result.append("The provider reports this flight was cancelled. Confirm with the airline.")
+    elif delay is None:
+        result.append("Departure delay: Unknown. The provider did not report a delay value.")
+    elif delay == 0:
+        result.append("Departure delay: 0 minutes reported (on time).")
+    elif delay < 0:
+        result.append(f"Departure timing: {abs(delay)} minutes early according to the provider.")
     else:
-        result += "- Weather is clear.\n"
-        result += "- Delay is likely due to late arrival of incoming aircraft (Rotational Delay).\n"
-        result += "- The aircraft assigned to this flight arrived late from its previous destination.\n"
+        result.append(f"Departure delay: {delay} minutes reported.")
+        result.append("Delay reason: Unconfirmed. Check with the airline for the cause.")
 
-    return result
+    icao = AIRPORT_ICAO.get(departure_iata)
+    if icao and status != "cancelled":
+        observation = _get_airport_observation(icao)
+        if observation:
+            result.append(f"Current departure airport weather (METAR): {observation}")
+    return "\n".join(result)
 
 all_tools = [get_weather, search_web, get_flight_delay_prediction]
